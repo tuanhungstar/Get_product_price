@@ -9,6 +9,8 @@ import subprocess
 import re
 import base64
 import mimetypes
+import shutil
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 import requests
@@ -588,6 +590,83 @@ class ChromeDriverDownloaderThread(QThread):
 
         except Exception as e:
             self.finished_signal.emit(False, str(e))
+
+
+class AppUpdaterThread(QThread):
+    log_signal = pyqtSignal(str, str) # message, level
+    finished_signal = pyqtSignal(bool, str, list) # success, error_msg, list_of_updated_files
+
+    def __init__(self, repo_url: str = "https://github.com/tuanhungstar/Get_product_price", parent=None):
+        super().__init__(parent)
+        self.repo_url = repo_url
+
+    def run(self):
+        try:
+            self.log_signal.emit(f"🌐 Connecting to GitHub repository: {self.repo_url}...", "INFO")
+            
+            zip_urls = [
+                "https://github.com/tuanhungstar/Get_product_price/archive/refs/heads/main.zip",
+                "https://github.com/tuanhungstar/Get_product_price/archive/refs/heads/master.zip"
+            ]
+            
+            resp = None
+            used_url = ""
+            for url in zip_urls:
+                self.log_signal.emit(f"📥 Attempting to download update archive from {url}...", "INFO")
+                r = safe_requests_get(url, timeout=30)
+                if r.status_code == 200:
+                    resp = r
+                    used_url = url
+                    break
+            
+            if not resp or resp.status_code != 200:
+                err_msg = f"Failed to download repository zip (HTTP status: {resp.status_code if resp else 'No connection'})"
+                self.finished_signal.emit(False, err_msg, [])
+                return
+            
+            self.log_signal.emit("📦 Download complete. Extracting Python (.py) source files...", "INFO")
+            z = zipfile.ZipFile(io.BytesIO(resp.content))
+            
+            updated_files = []
+            target_dir = os.getcwd()
+            
+            for member in z.namelist():
+                filename = os.path.basename(member)
+                if not filename or not filename.lower().endswith(".py"):
+                    continue
+                
+                file_content = z.read(member)
+                target_path = os.path.abspath(os.path.join(target_dir, filename))
+                
+                if os.path.exists(target_path):
+                    backup_dir = os.path.join(target_dir, "backup_version")
+                    os.makedirs(backup_dir, exist_ok=True)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    base_name, ext = os.path.splitext(filename)
+                    backup_filename = f"{base_name}_{timestamp}{ext}"
+                    backup_path = os.path.join(backup_dir, backup_filename)
+                    try:
+                        shutil.copy2(target_path, backup_path)
+                        self.log_signal.emit(f"💾 Created backup of '{filename}' at '{backup_path}'", "INFO")
+                    except Exception as e:
+                        self.log_signal.emit(f"⚠️ Warning: Could not create backup for '{filename}': {e}", "WARN")
+                
+                with open(target_path, "wb") as f:
+                    f.write(file_content)
+                
+                updated_files.append(filename)
+                self.log_signal.emit(f"✅ Replaced file: {filename}", "SUCCESS")
+            
+            if not updated_files:
+                self.finished_signal.emit(False, "No .py files found in the downloaded update package.", [])
+                return
+
+            self.log_signal.emit(f"🎉 Update completed! Updated {len(updated_files)} file(s): {', '.join(updated_files)}", "SUCCESS")
+            self.finished_signal.emit(True, "App updated successfully!", updated_files)
+
+        except Exception as e:
+            self.log_signal.emit(f"❌ Error during update: {str(e)}", "ERROR")
+            self.finished_signal.emit(False, str(e), [])
 
 
 class GoogleSearchThread(QThread):
@@ -1924,6 +2003,10 @@ class ChromeDriverTesterApp(QMainWindow):
         self.btn_manage_web_list.setToolTip("Manage priority website domain filters and popup closing rules in list_web.xlsx")
         tools_layout.addWidget(self.btn_manage_web_list)
 
+        self.btn_update_app = QPushButton("🔄 Update App from GitHub")
+        self.btn_update_app.setToolTip("Download latest .py files from GitHub (https://github.com/tuanhungstar/Get_product_price) and replace local files")
+        tools_layout.addWidget(self.btn_update_app)
+
         config_layout.addWidget(tools_group)
         config_layout.addStretch()
 
@@ -2048,6 +2131,57 @@ class ChromeDriverTesterApp(QMainWindow):
         self.btn_reset_config.clicked.connect(self._action_reset_config)
         self.btn_take_image.clicked.connect(self._action_launch_take_image)
         self.btn_manage_web_list.clicked.connect(self._action_open_web_list_editor)
+        self.btn_update_app.clicked.connect(self._action_update_app_from_github)
+
+    def _action_update_app_from_github(self):
+        """Prompts user and starts background thread to update application source files from GitHub."""
+        reply = QMessageBox.question(
+            self,
+            "Confirm Update App from GitHub",
+            "Are you sure you want to download and update application files from GitHub?\n\n"
+            "Repository: https://github.com/tuanhungstar/Get_product_price\n\n"
+            "This action will download the latest Python files (.py) and replace local files on your computer.\n"
+            "Existing files will be backed up in 'backup_version/'.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.btn_update_app.setEnabled(False)
+        self.btn_update_app.setText("⏳ Updating...")
+        self.log("🚀 Starting application update from GitHub repository (https://github.com/tuanhungstar/Get_product_price)...", "INFO")
+
+        self.app_updater_thread = AppUpdaterThread(
+            repo_url="https://github.com/tuanhungstar/Get_product_price",
+            parent=self
+        )
+        self.app_updater_thread.log_signal.connect(self.log)
+        self.app_updater_thread.finished_signal.connect(self._on_update_app_finished)
+        self.app_updater_thread.start()
+
+    def _on_update_app_finished(self, success: bool, msg_or_err: str, updated_files: list):
+        self.btn_update_app.setEnabled(True)
+        self.btn_update_app.setText("🔄 Update App from GitHub")
+
+        if success:
+            files_str = "\n".join(f"• {f}" for f in updated_files)
+            QMessageBox.warning(
+                self,
+                "App Update Completed - Restart Required",
+                f"Application files have been updated successfully from GitHub!\n\n"
+                f"Updated files:\n{files_str}\n\n"
+                "⚠️ Please restart the application to apply the changes."
+            )
+            self.log(f"🎉 Application updated successfully. Replaced files: {', '.join(updated_files)}. Please restart app to apply changes!", "SUCCESS")
+        else:
+            QMessageBox.critical(
+                self,
+                "Update Failed",
+                f"Failed to update application from GitHub:\n\n{msg_or_err}"
+            )
+            self.log(f"❌ Application update failed: {msg_or_err}", "ERROR")
 
         # Load default or saved configuration on startup
         self._load_default_or_saved_config()
