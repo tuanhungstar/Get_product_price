@@ -722,6 +722,57 @@ class GoogleSearchThread(QThread):
             self.results_signal.emit(False, [], str(e))
 
 
+class GeminiModelFetcherThread(QThread):
+    """Fetches the list of available Gemini models from the API that support generateContent."""
+    log_signal = pyqtSignal(str, str)          # message, level
+    finished_signal = pyqtSignal(bool, list, str)  # success, model_names_list, error_msg
+
+    def __init__(self, api_keys: list, parent=None):
+        super().__init__(parent)
+        self.api_keys = api_keys
+
+    def run(self):
+        if not self.api_keys:
+            self.finished_signal.emit(False, [], "No Gemini API Key configured. Please enter at least one key.")
+            return
+
+        last_error = ""
+        for i, key in enumerate(self.api_keys):
+            key_label = f"Key #{i + 1} (...{key[-6:]})"
+            self.log_signal.emit(f"Fetching Gemini model list using {key_label}...", "INFO")
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+                resp = safe_requests_get(url, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = data.get("models", [])
+                    supported = []
+                    for m in models:
+                        name = m.get("name", "")  # e.g. "models/gemini-2.5-flash"
+                        methods = m.get("supportedGenerationMethods", [])
+                        if "generateContent" in methods:
+                            # Strip "models/" prefix for cleaner display
+                            short_name = name.replace("models/", "") if name.startswith("models/") else name
+                            supported.append(short_name)
+                    if supported:
+                        supported.sort()
+                        self.log_signal.emit(f"✅ Found {len(supported)} compatible Gemini model(s) via {key_label}.", "SUCCESS")
+                        self.finished_signal.emit(True, supported, "")
+                        return
+                    else:
+                        last_error = "No models supporting generateContent found in API response."
+                        self.log_signal.emit(f"⚠️ {last_error}", "WARN")
+                else:
+                    err_info = resp.json().get("error", {}) if "json" in resp.headers.get("content-type", "") else {}
+                    last_error = err_info.get("message", f"HTTP {resp.status_code}: {resp.text[:200]}")
+                    self.log_signal.emit(f"❌ {key_label} API error: {last_error}. Trying next key...", "WARN")
+            except Exception as e:
+                last_error = str(e)
+                self.log_signal.emit(f"❌ {key_label} exception: {e}. Trying next key...", "WARN")
+
+        self.finished_signal.emit(False, [], f"All keys failed. Last error: {last_error}")
+
+
 class GeminiApiThread(QThread):
     log_signal = pyqtSignal(str, str) # message, level
     response_signal = pyqtSignal(bool, str) # success, response_text_or_error
@@ -842,6 +893,103 @@ def parse_numeric_price(price_str: str) -> float:
     return float('inf')
 
 
+# Rate-limit / quota HTTP status codes that should trigger key rotation
+_GEMINI_QUOTA_STATUS_CODES = {429, 503}
+
+
+def call_gemini_api_with_rotation(
+    gemini_keys: list,
+    gemini_model: str,
+    payload: dict,
+    max_retries: int,
+    retry_delay: float,
+    log_fn,
+    progress_fn=None,
+) -> tuple:
+    """
+    Call the Gemini API with automatic key rotation on rate-limit errors.
+
+    Strategy:
+    - For each key, try up to (max_retries + 1) attempts.
+    - On HTTP 429 / 503 (quota/rate-limit): rotate to next key immediately.
+    - On other HTTP errors: retry with same key, respecting max_retries.
+    - If all keys are exhausted (all quota-limited) or max_retries is exceeded
+      for every key, return failure with all_exhausted=True.
+
+    Returns:
+        (success: bool, raw_text: str, error_msg: str, all_exhausted: bool)
+    """
+    headers = {"Content-Type": "application/json"}
+    num_keys = len(gemini_keys)
+
+    # Track which keys have been quota-limited
+    quota_exhausted_keys = set()
+
+    # Total attempt budget across all keys
+    key_index = 0
+    attempt_on_key = 0  # attempts on current key
+
+    while True:
+        # Skip quota-exhausted keys
+        while key_index < num_keys and gemini_keys[key_index] in quota_exhausted_keys:
+            key_index += 1
+
+        if key_index >= num_keys:
+            # All keys exhausted
+            return (False, "", "All Gemini API keys have reached their quota/rate limit.", True)
+
+        current_key = gemini_keys[key_index]
+        key_label = f"Key #{key_index + 1}/{num_keys} (...{current_key[-6:]})"
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={current_key}"
+
+        try:
+            attempt_on_key += 1
+            log_fn(f"Gemini API request [{key_label}] attempt {attempt_on_key}/{max_retries + 1}...", "INFO")
+            gemini_resp = requests.post(gemini_url, json=payload, headers=headers, timeout=60)
+
+            if gemini_resp.status_code == 200:
+                raw_text_out = ""
+                res_json = gemini_resp.json()
+                for candidate in res_json.get("candidates", []):
+                    for part in candidate.get("content", {}).get("parts", []):
+                        if "text" in part:
+                            raw_text_out += part["text"]
+                return (True, raw_text_out, "", False)
+
+            elif gemini_resp.status_code in _GEMINI_QUOTA_STATUS_CODES:
+                # Quota/rate-limit: mark key as exhausted and rotate
+                err_info = gemini_resp.json().get("error", {}) if "json" in gemini_resp.headers.get("content-type", "") else {}
+                err_msg = err_info.get("message", f"HTTP {gemini_resp.status_code}")
+                quota_exhausted_keys.add(current_key)
+                log_fn(f"⚠️ {key_label} quota/rate-limit reached ({err_msg}). Rotating to next key...", "WARN")
+                if progress_fn:
+                    progress_fn(f"⚠️ Gemini Key #{key_index + 1} quota reached. Rotating key...")
+                key_index += 1
+                attempt_on_key = 0
+                continue
+
+            else:
+                # Other error: retry with same key
+                err_info = gemini_resp.json().get("error", {}) if "json" in gemini_resp.headers.get("content-type", "") else {}
+                err_msg = err_info.get("message", f"HTTP {gemini_resp.status_code}: {gemini_resp.text[:200]}")
+                if attempt_on_key <= max_retries:
+                    log_fn(f"Gemini API error ({err_msg}) [{key_label}]. Retrying in {retry_delay}s...", "WARN")
+                    if progress_fn:
+                        progress_fn(f"⚠️ Gemini error ({gemini_resp.status_code}). Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    return (False, "", f"Gemini API Error [{key_label}]: {err_msg}", False)
+
+        except Exception as e_req:
+            if attempt_on_key <= max_retries:
+                log_fn(f"Gemini API exception ({e_req}) [{key_label}]. Retrying in {retry_delay}s...", "WARN")
+                if progress_fn:
+                    progress_fn(f"⚠️ Gemini exception. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            else:
+                return (False, "", f"Gemini API Exception [{key_label}]: {e_req}", False)
+
+
 class GetPriceWorkflowThread(QThread):
     log_signal = pyqtSignal(str, str) # text, level
     progress_signal = pyqtSignal(str) # status text
@@ -860,12 +1008,17 @@ class GetPriceWorkflowThread(QThread):
         try:
             search_key = self.config.get("google_search_api_key", "").strip()
             cx = self.config.get("google_search_engine_id", "").strip()
-            gemini_key = self.config.get("gemini_api_key", "").strip()
+            gemini_keys_raw = self.config.get("gemini_api_key", "").strip()
+            gemini_keys = [k.strip() for k in gemini_keys_raw.split(",") if k.strip()]
             gemini_model = self.config.get("gemini_model", "gemini-2.5-flash").strip()
             driver_path = self.config.get("chromedriver_path", "").strip()
             delay_between_calls = float(self.config.get("gemini_delay_between_calls", 2.0))
             retry_delay = float(self.config.get("gemini_retry_delay", 5.0))
             max_retries = int(self.config.get("gemini_max_retries", 3))
+            # AI provider settings (Phase 7A)
+            ai_provider = self.config.get("ai_provider", "gemini")
+            local_ai_url = self.config.get("local_ai_url", "https://api-localai.germantest.net")
+            local_ai_model = self.config.get("local_ai_model", "qwen2.5vl:7b")
 
             if not search_key or not cx:
                 err = "Google Search API Key or CX is missing. Please configure them in the Configuration tab."
@@ -873,7 +1026,7 @@ class GetPriceWorkflowThread(QThread):
                 self.finished_signal.emit(False, [], err, "")
                 return
 
-            if not gemini_key:
+            if ai_provider != "local_ai" and not gemini_keys:
                 err = "Gemini API Key is missing. Please configure it in the Configuration tab."
                 self.progress_signal.emit("⚠️ Gemini API Key Missing")
                 self.finished_signal.emit(False, [], err, "")
@@ -1056,80 +1209,90 @@ class GetPriceWorkflowThread(QThread):
                 if not screenshot_path or not os.path.exists(screenshot_path):
                     continue
 
-                # Inter-call delay before calling Gemini API (when processing subsequent items)
+                # Inter-call delay before calling AI (when processing subsequent items)
                 if idx > 1 and delay_between_calls > 0:
-                    self.progress_signal.emit(f"⏳ Waiting {delay_between_calls}s delay before Gemini API call ({idx}/{total_targets})...")
-                    self.log_signal.emit(f"Inter-call delay: Sleeping {delay_between_calls}s before calling Gemini API...", "INFO")
+                    ai_name = "Local AI" if ai_provider == "local_ai" else "Gemini"
+                    self.progress_signal.emit(f"⏳ Waiting {delay_between_calls}s delay before {ai_name} call ({idx}/{total_targets})...")
+                    self.log_signal.emit(f"Inter-call delay: Sleeping {delay_between_calls}s before calling {ai_name} API...", "INFO")
                     time.sleep(delay_between_calls)
 
-                # Call Gemini API with automatic retry handling
-                self.progress_signal.emit(f"🤖 [{idx}/{total_targets}] Analyzing with Gemini AI...")
-                self.log_signal.emit(f"Step 6 ({idx}/{total_targets}): Sending screenshot to Gemini API...", "INFO")
+                # Call AI (Gemini or Local AI) with branching (Phase 7A)
+                if ai_provider == "local_ai":
+                    self.progress_signal.emit(f"🏠 [{idx}/{total_targets}] Analyzing with Local AI ({local_ai_model})...")
+                    self.log_signal.emit(f"Step 6 ({idx}/{total_targets}): Sending screenshot to Local AI server...", "INFO")
+                else:
+                    self.progress_signal.emit(f"🤖 [{idx}/{total_targets}] Analyzing with Gemini AI...")
+                    self.log_signal.emit(f"Step 6 ({idx}/{total_targets}): Sending screenshot to Gemini API...", "INFO")
 
                 try:
-                    with open(screenshot_path, "rb") as sf:
-                        encoded_b64 = base64.b64encode(sf.read()).decode("utf-8")
-
-                    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
-                    payload = {
-                        "contents": [
-                            {
-                                "parts": [
-                                    {"text": final_prompt},
-                                    {
-                                        "inline_data": {
-                                            "mime_type": "image/png",
-                                            "data": encoded_b64
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-
-                    headers = {"Content-Type": "application/json"}
                     raw_text_out = ""
                     parsed_dict = {}
+                    gem_success = False
+                    gem_err = ""
 
-                    for attempt in range(1, max_retries + 2):
+                    if ai_provider == "local_ai":
+                        # --- Local AI path ---
+                        la_success, raw_text_out, la_err = call_local_ai_api(
+                            local_ai_url=local_ai_url,
+                            local_ai_model=local_ai_model,
+                            prompt=final_prompt,
+                            image_path=screenshot_path,
+                            log_fn=self.log_signal.emit,
+                            progress_fn=self.progress_signal.emit,
+                        )
+                        gem_success = la_success
+                        gem_err = la_err
+                        all_exhausted = False
+                    else:
+                        # --- Gemini path ---
+                        with open(screenshot_path, "rb") as sf:
+                            encoded_b64 = base64.b64encode(sf.read()).decode("utf-8")
+
+                        payload = {
+                            "contents": [
+                                {
+                                    "parts": [
+                                        {"text": final_prompt},
+                                        {
+                                            "inline_data": {
+                                                "mime_type": "image/png",
+                                                "data": encoded_b64
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+
+                        gem_success, raw_text_out, gem_err, all_exhausted = call_gemini_api_with_rotation(
+                            gemini_keys=gemini_keys,
+                            gemini_model=gemini_model,
+                            payload=payload,
+                            max_retries=max_retries,
+                            retry_delay=retry_delay,
+                            log_fn=self.log_signal.emit,
+                            progress_fn=self.progress_signal.emit,
+                        )
+
+                        if all_exhausted:
+                            err = f"All Gemini API keys have reached their quota/rate limit. Workflow stopped.\n{gem_err}"
+                            self.log_signal.emit(f"❌ {err}", "ERROR")
+                            self.progress_signal.emit("❌ All Gemini API Keys Exhausted — Workflow Stopped")
+                            self.finished_signal.emit(False, [], err, "")
+                            return
+
+                    if gem_success:
                         try:
-                            self.log_signal.emit(f"Gemini API request attempt {attempt}/{max_retries + 1}...", "INFO")
-                            gemini_resp = requests.post(gemini_url, json=payload, headers=headers, timeout=60)
-
-                            if gemini_resp.status_code == 200:
-                                res_json = gemini_resp.json()
-                                for candidate in res_json.get("candidates", []):
-                                    for part in candidate.get("content", {}).get("parts", []):
-                                        if "text" in part:
-                                            raw_text_out += part["text"]
-
-                                try:
-                                    match = re.search(r'\{.*\}', raw_text_out, re.DOTALL)
-                                    if match:
-                                        parsed_dict = json.loads(match.group(0))
-                                    else:
-                                        parsed_dict = json.loads(raw_text_out)
-                                except Exception:
-                                    parsed_dict = {"product_name": "Parsing error", "price": "N/A", "status": "N/A", "similarity": "0%"}
-                                break
+                            match = re.search(r'\{.*\}', raw_text_out, re.DOTALL)
+                            if match:
+                                parsed_dict = json.loads(match.group(0))
                             else:
-                                err_info = gemini_resp.json().get("error", {}) if "json" in gemini_resp.headers.get("content-type", "") else {}
-                                err_msg = err_info.get("message", f"HTTP {gemini_resp.status_code}: {gemini_resp.text[:200]}")
-                                raw_text_out = f"Gemini API Error: {err_msg}"
-                                if attempt <= max_retries:
-                                    self.progress_signal.emit(f"⚠️ Gemini API Busy ({gemini_resp.status_code}). Retrying in {retry_delay}s ({attempt}/{max_retries})...")
-                                    self.log_signal.emit(f"Gemini API returned status {gemini_resp.status_code} ({err_msg}). Retrying in {retry_delay}s...", "WARN")
-                                    time.sleep(retry_delay)
-                                else:
-                                    parsed_dict = {"product_name": f"API Error ({gemini_resp.status_code})", "price": "N/A", "status": "Error", "similarity": "0%"}
-                        except Exception as e_req:
-                            raw_text_out = f"Gemini API Exception: {e_req}"
-                            if attempt <= max_retries:
-                                self.progress_signal.emit(f"⚠️ Gemini Exception. Retrying in {retry_delay}s ({attempt}/{max_retries})...")
-                                self.log_signal.emit(f"Gemini API exception ({e_req}). Retrying in {retry_delay}s...", "WARN")
-                                time.sleep(retry_delay)
-                            else:
-                                parsed_dict = {"product_name": "Connection Error", "price": "N/A", "status": "Error", "similarity": "0%"}
+                                parsed_dict = json.loads(raw_text_out)
+                        except Exception:
+                            parsed_dict = {"product_name": "Parsing error", "price": "N/A", "status": "N/A", "similarity": "0%"}
+                    else:
+                        raw_text_out = f"AI Error: {gem_err}"
+                        parsed_dict = {"product_name": "API Error", "price": "N/A", "status": "Error", "similarity": "0%"}
 
                     num_price = parse_numeric_price(parsed_dict.get("price", ""))
                     results_list.append({
@@ -1147,10 +1310,11 @@ class GetPriceWorkflowThread(QThread):
                         "final_prompt": final_prompt
                     })
 
-                    self.log_signal.emit(f"Extracted price for [{item_domain}]: {parsed_dict.get('price')}", "SUCCESS")
+                    ai_label = "Local AI" if ai_provider == "local_ai" else "Gemini"
+                    self.log_signal.emit(f"Extracted price via {ai_label} for [{item_domain}]: {parsed_dict.get('price')}", "SUCCESS")
 
                 except Exception as e_gem:
-                    self.log_signal.emit(f"Gemini API request error for {target_link}: {e_gem}", "ERROR")
+                    self.log_signal.emit(f"AI API request error for {target_link}: {e_gem}", "ERROR")
 
             if results_list:
                 self.progress_signal.emit("✅ Price extraction complete!")
@@ -1265,18 +1429,23 @@ class GetPriceAllWorkerThread(QThread):
         try:
             search_key = self.config.get("google_search_api_key", "").strip()
             cx = self.config.get("google_search_engine_id", "").strip()
-            gemini_key = self.config.get("gemini_api_key", "").strip()
+            gemini_keys_raw = self.config.get("gemini_api_key", "").strip()
+            gemini_keys = [k.strip() for k in gemini_keys_raw.split(",") if k.strip()]
             gemini_model = self.config.get("gemini_model", "gemini-2.5-flash").strip()
             driver_path = self.config.get("chromedriver_path", "").strip()
             delay_between_calls = float(self.config.get("gemini_delay_between_calls", 2.0))
             retry_delay = float(self.config.get("gemini_retry_delay", 5.0))
             max_retries = int(self.config.get("gemini_max_retries", 3))
+            # AI provider settings (Phase 7B)
+            ai_provider = self.config.get("ai_provider", "gemini")
+            local_ai_url = self.config.get("local_ai_url", "https://api-localai.germantest.net")
+            local_ai_model = self.config.get("local_ai_model", "qwen2.5vl:7b")
 
             if not search_key or not cx:
                 self.finished_signal.emit(False, "Google Search API Key or CX is missing. Please configure them in Configuration tab.")
                 return
 
-            if not gemini_key:
+            if ai_provider != "local_ai" and not gemini_keys:
                 self.finished_signal.emit(False, "Gemini API Key is missing. Please configure it in Configuration tab.")
                 return
 
@@ -1493,55 +1662,70 @@ class GetPriceAllWorkerThread(QThread):
                     if link_idx > 1 and delay_between_calls > 0:
                         time.sleep(delay_between_calls)
 
-                    # Send screenshot to Gemini API
-                    self.progress_signal.emit(f"🤖 Row {excel_row_num} [{link_idx}/{len(filtered_items)}]: Analyzing with Gemini AI...")
+                    # Send screenshot to AI (Gemini or Local AI) — Phase 7B
+                    ai_label_b = "Local AI" if ai_provider == "local_ai" else "Gemini"
+                    self.progress_signal.emit(f"🤖 Row {excel_row_num} [{link_idx}/{len(filtered_items)}]: Analyzing with {ai_label_b}...")
                     try:
-                        with open(screenshot_path, "rb") as sf:
-                            encoded_b64 = base64.b64encode(sf.read()).decode("utf-8")
-
-                        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
-                        payload = {
-                            "contents": [
-                                {
-                                    "parts": [
-                                        {"text": final_prompt},
-                                        {"inline_data": {"mime_type": "image/png", "data": encoded_b64}}
-                                    ]
-                                }
-                            ]
-                        }
-                        headers = {"Content-Type": "application/json"}
                         raw_text_out = ""
                         parsed_dict = {}
+                        gem_success = False
+                        gem_err = ""
 
-                        for attempt in range(1, max_retries + 2):
+                        if ai_provider == "local_ai":
+                            la_success, raw_text_out, la_err = call_local_ai_api(
+                                local_ai_url=local_ai_url,
+                                local_ai_model=local_ai_model,
+                                prompt=final_prompt,
+                                image_path=screenshot_path,
+                                log_fn=self.log_signal.emit,
+                                progress_fn=self.progress_signal.emit,
+                            )
+                            gem_success = la_success
+                            gem_err = la_err
+                            all_exhausted = False
+                        else:
+                            with open(screenshot_path, "rb") as sf:
+                                encoded_b64 = base64.b64encode(sf.read()).decode("utf-8")
+
+                            payload = {
+                                "contents": [
+                                    {
+                                        "parts": [
+                                            {"text": final_prompt},
+                                            {"inline_data": {"mime_type": "image/png", "data": encoded_b64}}
+                                        ]
+                                    }
+                                ]
+                            }
+
+                            gem_success, raw_text_out, gem_err, all_exhausted = call_gemini_api_with_rotation(
+                                gemini_keys=gemini_keys,
+                                gemini_model=gemini_model,
+                                payload=payload,
+                                max_retries=max_retries,
+                                retry_delay=retry_delay,
+                                log_fn=self.log_signal.emit,
+                                progress_fn=self.progress_signal.emit,
+                            )
+
+                            if all_exhausted:
+                                err = f"All Gemini API keys have reached their quota/rate limit. Batch stopped.\n{gem_err}"
+                                self.log_signal.emit(f"❌ {err}", "ERROR")
+                                self.progress_signal.emit("❌ All Gemini API Keys Exhausted — Batch Stopped")
+                                self.finished_signal.emit(False, err)
+                                return
+
+                        if gem_success:
                             try:
-                                gemini_resp = requests.post(gemini_url, json=payload, headers=headers, timeout=60)
-                                if gemini_resp.status_code == 200:
-                                    res_json = gemini_resp.json()
-                                    for candidate in res_json.get("candidates", []):
-                                        for part in candidate.get("content", {}).get("parts", []):
-                                            if "text" in part:
-                                                raw_text_out += part["text"]
-                                    try:
-                                        match = re.search(r'\{.*\}', raw_text_out, re.DOTALL)
-                                        if match:
-                                            parsed_dict = json.loads(match.group(0))
-                                        else:
-                                            parsed_dict = json.loads(raw_text_out)
-                                    except Exception:
-                                        parsed_dict = {"product_name": "Parsing error", "price": "N/A", "status": "N/A", "similarity": "0%"}
-                                    break
+                                match = re.search(r'\{.*\}', raw_text_out, re.DOTALL)
+                                if match:
+                                    parsed_dict = json.loads(match.group(0))
                                 else:
-                                    if attempt <= max_retries:
-                                        time.sleep(retry_delay)
-                                    else:
-                                        parsed_dict = {"product_name": f"API Error ({gemini_resp.status_code})", "price": "N/A", "status": "Error", "similarity": "0%"}
-                            except Exception as e_req:
-                                if attempt <= max_retries:
-                                    time.sleep(retry_delay)
-                                else:
-                                    parsed_dict = {"product_name": "Connection Error", "price": "N/A", "status": "Error", "similarity": "0%"}
+                                    parsed_dict = json.loads(raw_text_out)
+                            except Exception:
+                                parsed_dict = {"product_name": "Parsing error", "price": "N/A", "status": "N/A", "similarity": "0%"}
+                        else:
+                            parsed_dict = {"product_name": "API Error", "price": "N/A", "status": "Error", "similarity": "0%"}
 
                         num_price = parse_numeric_price(parsed_dict.get("price", ""))
                         row_link_results.append({
@@ -1557,7 +1741,7 @@ class GetPriceAllWorkerThread(QThread):
                             "raw_gemini": raw_text_out
                         })
                     except Exception as e_gem:
-                        self.log_signal.emit(f"Gemini API error for {target_link}: {e_gem}", "ERROR")
+                        self.log_signal.emit(f"AI API error for {target_link}: {e_gem}", "ERROR")
 
                 if not row_link_results:
                     self.log_signal.emit(f"Row {excel_row_num}: No extracted price results.", "WARN")
@@ -1644,7 +1828,125 @@ DEFAULT_CONFIG = {
     "google_search_api_key": "",
     "google_search_engine_id": "",
     "target_url": "https://www.google.com",
+    "ai_provider": "gemini",
+    "local_ai_url": "https://api-localai.germantest.net",
+    "local_ai_model": "qwen2.5vl:7b",
 }
+
+
+# ---------------------------------------------------------------------------
+# Local AI API helper  (Phase 2)
+# ---------------------------------------------------------------------------
+
+_LOCAL_AI_SUPPORTED_MODELS = ["qwen2.5vl:7b", "qwen2.5vl:3b", "qwen2.5vl:32b"]
+
+def call_local_ai_api(
+    local_ai_url: str,
+    local_ai_model: str,
+    prompt: str,
+    image_path: str = None,
+    log_fn=None,
+    progress_fn=None,
+) -> tuple:
+    """
+    Call the Local AI FastAPI server at /invoice-custom.
+
+    Sends a screenshot (or any image/pdf) together with a prompt to the
+    local Ollama-backed server and returns the parsed JSON as a string.
+
+    Returns: (success: bool, response_text: str, error_msg: str)
+    """
+    def _log(msg, level="INFO"):
+        if log_fn:
+            log_fn(msg, level)
+
+    def _progress(msg):
+        if progress_fn:
+            progress_fn(msg)
+
+    endpoint = local_ai_url.rstrip("/") + "/invoice-custom"
+    model = local_ai_model if local_ai_model in _LOCAL_AI_SUPPORTED_MODELS else "qwen2.5vl:7b"
+
+    _log(f"Local AI request → {endpoint} | model={model}", "INFO")
+    _progress(f"🏠 Calling Local AI ({model})...")
+
+    try:
+        if image_path and os.path.exists(image_path):
+            with open(image_path, "rb") as fh:
+                file_bytes = fh.read()
+            fname = os.path.basename(image_path)
+            # Determine mime type
+            mime = mimetypes.guess_type(fname)[0] or "image/png"
+            files = {"file": (fname, file_bytes, mime)}
+        else:
+            # Send a tiny blank PNG so the server doesn't reject the request
+            import struct, zlib
+            def _blank_png():
+                hdr = b"\x89PNG\r\n\x1a\n"
+                ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+                ihdr_crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF
+                ihdr = struct.pack(">I", 13) + b"IHDR" + ihdr_data + struct.pack(">I", ihdr_crc)
+                idat_data = zlib.compress(b"\x00\xFF\xFF\xFF")
+                idat_crc = zlib.crc32(b"IDAT" + idat_data) & 0xFFFFFFFF
+                idat = struct.pack(">I", len(idat_data)) + b"IDAT" + idat_data + struct.pack(">I", idat_crc)
+                iend_crc = zlib.crc32(b"IEND") & 0xFFFFFFFF
+                iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", iend_crc)
+                return hdr + ihdr + idat + iend
+            files = {"file": ("blank.png", _blank_png(), "image/png")}
+
+        data = {"prompt": prompt, "model": model}
+        resp = requests.post(endpoint, files=files, data=data, timeout=180)
+        resp.raise_for_status()
+        result_json = resp.json()
+        result_text = json.dumps(result_json, ensure_ascii=False, indent=2)
+        _log(f"Local AI response received (model={model}).", "SUCCESS")
+        _progress(f"✅ Local AI response received.")
+        return (True, result_text, "")
+    except requests.exceptions.ConnectionError as e:
+        err = f"Cannot connect to Local AI server at {local_ai_url}: {e}"
+        _log(err, "ERROR")
+        _progress("❌ Local AI connection failed.")
+        return (False, "", err)
+    except requests.exceptions.Timeout:
+        err = f"Local AI server timed out after 180s (URL: {local_ai_url})."
+        _log(err, "ERROR")
+        _progress("❌ Local AI request timed out.")
+        return (False, "", err)
+    except Exception as e:
+        err = f"Local AI API error: {e}"
+        _log(err, "ERROR")
+        _progress("❌ Local AI error.")
+        return (False, "", err)
+
+
+# ---------------------------------------------------------------------------
+# LocalAiTestThread  (Phase 8C) — used by the AI Test tab
+# ---------------------------------------------------------------------------
+
+class LocalAiTestThread(QThread):
+    """Background thread for testing Local AI from the AI Test tab."""
+    log_signal = pyqtSignal(str, str)
+    response_signal = pyqtSignal(bool, str)
+
+    def __init__(self, url: str, model: str, prompt: str, media_path: str = "", parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.model = model
+        self.prompt = prompt
+        self.media_path = media_path
+
+    def run(self):
+        success, result_text, err = call_local_ai_api(
+            local_ai_url=self.url,
+            local_ai_model=self.model,
+            prompt=self.prompt,
+            image_path=self.media_path if self.media_path else None,
+            log_fn=self.log_signal.emit,
+        )
+        if success:
+            self.response_signal.emit(True, result_text)
+        else:
+            self.response_signal.emit(False, err)
 
 
 class ChromeDriverTesterApp(QMainWindow):
@@ -1672,6 +1974,7 @@ class ChromeDriverTesterApp(QMainWindow):
         self.batch_thread: Optional[GetPriceAllWorkerThread] = None
 
         self._init_ui()
+        self._load_default_or_saved_config()
 
     def _init_ui(self):
         central_widget = QWidget()
@@ -1710,9 +2013,25 @@ class ChromeDriverTesterApp(QMainWindow):
         self.chk_process_first_only.setToolTip("Checked: process top matching link only. Unchecked: process all matching priority links sequentially.")
         input_layout.addWidget(self.chk_process_first_only, 1, 0, 1, 1)
 
+        # AI provider selector (Phase 5) — synced with Configuration tab
+        gp_ai_box = QHBoxLayout()
+        gp_ai_label = QLabel("AI Backend:")
+        gp_ai_label.setStyleSheet("font-weight: bold;")
+        gp_ai_box.addWidget(gp_ai_label)
+        self.get_price_radio_gemini = QRadioButton("🌐 Gemini")
+        self.get_price_radio_gemini.setChecked(True)
+        gp_ai_box.addWidget(self.get_price_radio_gemini)
+        self.get_price_radio_local_ai = QRadioButton("🏠 Local AI")
+        gp_ai_box.addWidget(self.get_price_radio_local_ai)
+        self.get_price_ai_model_label = QLabel("")
+        self.get_price_ai_model_label.setStyleSheet("color: #555; font-style: italic;")
+        gp_ai_box.addWidget(self.get_price_ai_model_label)
+        gp_ai_box.addStretch()
+        input_layout.addLayout(gp_ai_box, 2, 0, 1, 3)
+
         self.get_price_status_label = QLabel("Ready to search.")
         self.get_price_status_label.setStyleSheet("font-weight: bold; color: #2b5797;")
-        input_layout.addWidget(self.get_price_status_label, 1, 1, 1, 2)
+        input_layout.addWidget(self.get_price_status_label, 3, 1, 1, 2)
 
         get_price_layout.addWidget(input_group)
 
@@ -1908,7 +2227,7 @@ class ChromeDriverTesterApp(QMainWindow):
         gemini_layout.addWidget(QLabel("Gemini API Key:"), 0, 0)
 
         self.gemini_key_input = QLineEdit()
-        self.gemini_key_input.setPlaceholderText("Enter Gemini API Key (e.g. AIzaSy...)")
+        self.gemini_key_input.setPlaceholderText("Enter Gemini API Key(s), comma-separated for key rotation (e.g. AIzaSy...,AIzaSy...)")
         self.gemini_key_input.setEchoMode(QLineEdit.EchoMode.Password)
 
         self.btn_toggle_gemini_key = QPushButton("👁️ Show")
@@ -1931,7 +2250,14 @@ class ChromeDriverTesterApp(QMainWindow):
             "gemini-1.5-pro",
             "gemini-1.0-pro"
         ])
-        gemini_layout.addWidget(self.gemini_model_combo, 1, 1)
+
+        self.btn_fetch_gemini_models = QPushButton("🔄 Fetch Models")
+        self.btn_fetch_gemini_models.setToolTip("Query the Gemini API to get all available models that support generateContent and populate the dropdown")
+
+        gemini_model_box = QHBoxLayout()
+        gemini_model_box.addWidget(self.gemini_model_combo)
+        gemini_model_box.addWidget(self.btn_fetch_gemini_models)
+        gemini_layout.addLayout(gemini_model_box, 1, 1)
 
         gemini_layout.addWidget(QLabel("Delay between API Calls (sec):"), 2, 0)
         self.spin_gemini_delay_between_calls = QDoubleSpinBox()
@@ -1959,7 +2285,42 @@ class ChromeDriverTesterApp(QMainWindow):
 
         config_layout.addWidget(gemini_group)
 
-        # 3. Google Custom Search API Settings
+        # 2.5. AI Provider Selection
+        ai_provider_group = QGroupBox("2.5. 🤖 AI Provider Selection")
+        ai_provider_layout = QHBoxLayout(ai_provider_group)
+
+        self.radio_gemini = QRadioButton("🌐 Google Gemini API")
+        self.radio_gemini.setChecked(True)
+        self.radio_gemini.setToolTip("Use Google Gemini API for screenshot analysis (requires API key)")
+        ai_provider_layout.addWidget(self.radio_gemini)
+
+        self.radio_local_ai = QRadioButton("🏠 Local AI Server (Ollama)")
+        self.radio_local_ai.setToolTip("Use your local Ollama-backed AI server for screenshot analysis (no API key needed)")
+        ai_provider_layout.addWidget(self.radio_local_ai)
+        ai_provider_layout.addStretch()
+        config_layout.addWidget(ai_provider_group)
+
+        # 3. Local AI Server Configuration
+        local_ai_group = QGroupBox("3. 🏠 Local AI Server Configuration")
+        local_ai_layout = QGridLayout(local_ai_group)
+
+        local_ai_layout.addWidget(QLabel("Server URL:"), 0, 0)
+        self.local_ai_url_input = QLineEdit()
+        self.local_ai_url_input.setPlaceholderText("https://api-localai.germantest.net")
+        local_ai_layout.addWidget(self.local_ai_url_input, 0, 1)
+
+        self.btn_test_local_ai = QPushButton("🔗 Test Connection")
+        self.btn_test_local_ai.setToolTip("Check if the Local AI server is reachable (GET /docs)")
+        local_ai_layout.addWidget(self.btn_test_local_ai, 0, 2)
+
+        local_ai_layout.addWidget(QLabel("AI Model:"), 1, 0)
+        self.local_ai_model_combo = QComboBox()
+        self.local_ai_model_combo.addItems(["qwen2.5vl:7b", "qwen2.5vl:3b", "qwen2.5vl:32b"])
+        self.local_ai_model_combo.setToolTip("Select the Ollama model to use on the local AI server")
+        local_ai_layout.addWidget(self.local_ai_model_combo, 1, 1)
+        config_layout.addWidget(local_ai_group)
+
+        # 4. Google Custom Search API Settings
         search_group = QGroupBox("3. Google Custom Search API Configuration")
         search_layout = QGridLayout(search_group)
         search_layout.addWidget(QLabel("Google Search API Key:"), 0, 0)
@@ -2051,17 +2412,35 @@ class ChromeDriverTesterApp(QMainWindow):
         self.tab_widget.addTab(tab_search, "🔍 Google Search Test")
 
         # ==========================================
-        # TAB 5: Google Gemini Test
+        # TAB 5: AI Test (Gemini + Local AI)
         # ==========================================
         tab_gemini = QWidget()
         gemini_tab_layout = QVBoxLayout(tab_gemini)
+
+        # 0. AI Provider selector for this test tab (Phase 8A)
+        test_provider_group = QGroupBox("0. 🤖 AI Provider for Testing")
+        test_provider_layout = QGridLayout(test_provider_group)
+
+        self.test_radio_gemini = QRadioButton("🌐 Google Gemini")
+        self.test_radio_gemini.setChecked(True)
+        test_provider_layout.addWidget(self.test_radio_gemini, 0, 0)
+
+        self.test_radio_local_ai = QRadioButton("🏠 Local AI Server")
+        test_provider_layout.addWidget(self.test_radio_local_ai, 0, 1)
+
+        test_provider_layout.addWidget(QLabel("Local AI Model:"), 1, 0)
+        self.test_local_ai_model_combo = QComboBox()
+        self.test_local_ai_model_combo.addItems(["qwen2.5vl:7b", "qwen2.5vl:3b", "qwen2.5vl:32b"])
+        self.test_local_ai_model_combo.setToolTip("Model to use when Local AI is selected")
+        test_provider_layout.addWidget(self.test_local_ai_model_combo, 1, 1)
+        gemini_tab_layout.addWidget(test_provider_group)
 
         prompt_group = QGroupBox("1. Prompt & Optional Media File (Image / PDF)")
         prompt_layout = QGridLayout(prompt_group)
 
         prompt_layout.addWidget(QLabel("Prompt Text:"), 0, 0)
         self.gemini_prompt_input = QTextEdit()
-        self.gemini_prompt_input.setPlaceholderText("Enter prompt instructions or question for Gemini...")
+        self.gemini_prompt_input.setPlaceholderText("Enter prompt instructions or question for the AI...")
         self.gemini_prompt_input.setMaximumHeight(90)
         prompt_layout.addWidget(self.gemini_prompt_input, 0, 1, 1, 2)
 
@@ -2080,23 +2459,23 @@ class ChromeDriverTesterApp(QMainWindow):
         media_btn_layout.addWidget(self.btn_clear_media)
         prompt_layout.addLayout(media_btn_layout, 1, 2)
 
-        self.btn_send_gemini = QPushButton("🚀 Send Prompt to Gemini")
+        self.btn_send_gemini = QPushButton("🚀 Send Prompt to AI")
         self.btn_send_gemini.clicked.connect(self._action_send_gemini_prompt)
         prompt_layout.addWidget(self.btn_send_gemini, 2, 0, 1, 3)
 
         gemini_tab_layout.addWidget(prompt_group)
 
-        response_group = QGroupBox("2. Gemini Response Output")
+        response_group = QGroupBox("2. AI Response Output")
         response_layout = QVBoxLayout(response_group)
 
         self.gemini_output_text = QTextEdit()
         self.gemini_output_text.setReadOnly(True)
-        self.gemini_output_text.setPlaceholderText("Gemini response text will appear here...")
+        self.gemini_output_text.setPlaceholderText("AI response will appear here...")
         response_layout.addWidget(self.gemini_output_text)
 
         gemini_tab_layout.addWidget(response_group)
 
-        self.tab_widget.addTab(tab_gemini, "🤖 Google Gemini Test")
+        self.tab_widget.addTab(tab_gemini, "🤖 AI Test")
 
         # Splitter: Tabs on top, Activity Log at bottom
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -2132,6 +2511,61 @@ class ChromeDriverTesterApp(QMainWindow):
         self.btn_take_image.clicked.connect(self._action_launch_take_image)
         self.btn_manage_web_list.clicked.connect(self._action_open_web_list_editor)
         self.btn_update_app.clicked.connect(self._action_update_app_from_github)
+        self.btn_fetch_gemini_models.clicked.connect(self._action_fetch_gemini_models)
+        self.btn_test_local_ai.clicked.connect(self._action_test_local_ai_connection)
+        # AI provider sync: master Config tab radio → all sub-tab radios
+        self.radio_gemini.toggled.connect(self._on_ai_provider_changed)
+        # Reverse sync: sub-tab radios → master Config tab radio
+        self.get_price_radio_gemini.toggled.connect(self._on_sub_tab_ai_changed)
+        self.get_price_radio_local_ai.toggled.connect(self._on_sub_tab_ai_changed)
+        self.get_price_all_radio_gemini.toggled.connect(self._on_sub_tab_ai_changed)
+        self.get_price_all_radio_local_ai.toggled.connect(self._on_sub_tab_ai_changed)
+        self.test_radio_gemini.toggled.connect(self._on_sub_tab_ai_changed)
+        self.test_radio_local_ai.toggled.connect(self._on_sub_tab_ai_changed)
+
+    def _action_fetch_gemini_models(self):
+        """Starts a background thread to query the Gemini API for available models and populate the dropdown."""
+        keys_raw = self.gemini_key_input.text().strip()
+        gemini_keys = [k.strip() for k in keys_raw.split(",") if k.strip()]
+        if not gemini_keys:
+            QMessageBox.warning(self, "No API Key", "Please enter at least one Gemini API Key before fetching models.")
+            return
+
+        self.btn_fetch_gemini_models.setEnabled(False)
+        self.btn_fetch_gemini_models.setText("⏳ Fetching...")
+        self.log("🔍 Querying Gemini API for available models...", "INFO")
+
+        self._gemini_model_fetcher_thread = GeminiModelFetcherThread(api_keys=gemini_keys, parent=self)
+        self._gemini_model_fetcher_thread.log_signal.connect(self.log)
+        self._gemini_model_fetcher_thread.finished_signal.connect(self._on_gemini_models_fetched)
+        self._gemini_model_fetcher_thread.start()
+
+    def _on_gemini_models_fetched(self, success: bool, model_names: list, error_msg: str):
+        """Called when GeminiModelFetcherThread finishes. Populates the model dropdown."""
+        self.btn_fetch_gemini_models.setEnabled(True)
+        self.btn_fetch_gemini_models.setText("🔄 Fetch Models")
+
+        if not success:
+            QMessageBox.critical(self, "Fetch Models Failed", f"Could not retrieve Gemini model list:\n\n{error_msg}")
+            self.log(f"❌ Failed to fetch Gemini models: {error_msg}", "ERROR")
+            return
+
+        # Remember currently selected model so we can re-select it
+        current_model = self.gemini_model_combo.currentText().strip()
+
+        self.gemini_model_combo.blockSignals(True)
+        self.gemini_model_combo.clear()
+        self.gemini_model_combo.addItems(model_names)
+        self.gemini_model_combo.blockSignals(False)
+
+        # Restore previous selection if it still exists in the new list
+        idx = self.gemini_model_combo.findText(current_model)
+        if idx >= 0:
+            self.gemini_model_combo.setCurrentIndex(idx)
+        elif model_names:
+            self.gemini_model_combo.setCurrentIndex(0)
+
+        self.log(f"🎉 Gemini model list updated: {len(model_names)} model(s) available. {', '.join(model_names[:5])}{'...' if len(model_names) > 5 else ''}", "SUCCESS")
 
     def _action_update_app_from_github(self):
         """Prompts user and starts background thread to update application source files from GitHub."""
@@ -2182,9 +2616,6 @@ class ChromeDriverTesterApp(QMainWindow):
                 f"Failed to update application from GitHub:\n\n{msg_or_err}"
             )
             self.log(f"❌ Application update failed: {msg_or_err}", "ERROR")
-
-        # Load default or saved configuration on startup
-        self._load_default_or_saved_config()
 
     def _action_open_web_list_editor(self):
         """Opens the QDialog modal to view, edit, add, delete and save list_web.xlsx configuration."""
@@ -2396,39 +2827,204 @@ class ChromeDriverTesterApp(QMainWindow):
             self.gemini_media_input.setText(fname)
 
     def _action_send_gemini_prompt(self):
-        if self.gemini_thread and self.gemini_thread.isRunning():
+        """Phase 8B: Dispatch to Gemini or Local AI depending on the AI Test tab radio selection."""
+        # Check for a running test thread (either type)
+        if (self.gemini_thread and self.gemini_thread.isRunning()) or \
+           (hasattr(self, 'local_ai_test_thread') and self.local_ai_test_thread and self.local_ai_test_thread.isRunning()):
             return
 
-        api_key = self.gemini_api_key
-        model = self.gemini_model
         prompt = self.gemini_prompt_input.toPlainText().strip()
         media_path = self.gemini_media_input.text().strip()
 
-        if not api_key:
-            return self.log("Gemini API Key is empty. Configure it in the Configuration tab.", "WARN")
         if not prompt and not media_path:
             return self.log("Please enter a prompt or attach a file.", "WARN")
 
         self.btn_send_gemini.setEnabled(False)
         self.btn_send_gemini.setText("⏳ Processing...")
         self.gemini_output_text.clear()
-        self.log(f"Sending prompt to Gemini ({model})...", "HEADING")
 
-        self.gemini_thread = GeminiApiThread(api_key, model, prompt, media_path)
-        self.gemini_thread.log_signal.connect(self.log)
-        self.gemini_thread.response_signal.connect(self._on_gemini_finished)
-        self.gemini_thread.start()
+        if self.test_radio_local_ai.isChecked():
+            # --- Local AI path ---
+            local_ai_url = self.local_ai_url_input.text().strip() or "https://api-localai.germantest.net"
+            local_ai_model = self.test_local_ai_model_combo.currentText().strip()
+            self.log(f"Sending prompt to Local AI ({local_ai_model}) @ {local_ai_url}...", "HEADING")
+
+            self.local_ai_test_thread = LocalAiTestThread(
+                url=local_ai_url,
+                model=local_ai_model,
+                prompt=prompt,
+                media_path=media_path,
+                parent=self,
+            )
+            self.local_ai_test_thread.log_signal.connect(self.log)
+            self.local_ai_test_thread.response_signal.connect(self._on_gemini_finished)
+            self.local_ai_test_thread.start()
+        else:
+            # --- Gemini path ---
+            api_key = self.gemini_api_key
+            model = self.gemini_model
+            if not api_key:
+                self.btn_send_gemini.setEnabled(True)
+                self.btn_send_gemini.setText("🚀 Send Prompt to AI")
+                return self.log("Gemini API Key is empty. Configure it in the Configuration tab.", "WARN")
+
+            self.log(f"Sending prompt to Gemini ({model})...", "HEADING")
+            self.gemini_thread = GeminiApiThread(api_key, model, prompt, media_path)
+            self.gemini_thread.log_signal.connect(self.log)
+            self.gemini_thread.response_signal.connect(self._on_gemini_finished)
+            self.gemini_thread.start()
 
     def _on_gemini_finished(self, success: bool, output_text: str):
         self.btn_send_gemini.setEnabled(True)
-        self.btn_send_gemini.setText("🚀 Send Prompt to Gemini")
+        self.btn_send_gemini.setText("🚀 Send Prompt to AI")
 
         if success:
             self.gemini_output_text.setPlainText(output_text)
-            self.log("Gemini response received successfully!", "SUCCESS")
+            self.log("AI response received successfully!", "SUCCESS")
         else:
             self.gemini_output_text.setPlainText(f"ERROR: {output_text}")
-            self.log(f"Gemini API request failed: {output_text}", "ERROR")
+            self.log(f"AI request failed: {output_text}", "ERROR")
+
+    # --- Phase 9: AI Provider Sync Helper ---
+    def _on_ai_provider_changed(self, checked: bool = True):
+        """Keep AI provider radio buttons in sync across all tabs when the master (Config tab) changes."""
+        is_local = self.radio_local_ai.isChecked()
+        # Get Price tab
+        if hasattr(self, 'get_price_radio_local_ai'):
+            self.get_price_radio_local_ai.setChecked(is_local)
+            self.get_price_radio_gemini.setChecked(not is_local)
+            model_text = self.local_ai_model_combo.currentText() if is_local else self.gemini_model_combo.currentText()
+            self.get_price_ai_model_label.setText(f"({model_text})")
+        # Get Price All tab
+        if hasattr(self, 'get_price_all_radio_local_ai'):
+            self.get_price_all_radio_local_ai.setChecked(is_local)
+            self.get_price_all_radio_gemini.setChecked(not is_local)
+            model_text = self.local_ai_model_combo.currentText() if is_local else self.gemini_model_combo.currentText()
+            self.get_price_all_ai_model_label.setText(f"({model_text})")
+        # AI Test tab
+        if hasattr(self, 'test_radio_local_ai'):
+            self.test_radio_local_ai.setChecked(is_local)
+            self.test_radio_gemini.setChecked(not is_local)
+            if is_local:
+                # Sync the test tab model combo with the config tab model
+                cfg_model = self.local_ai_model_combo.currentText()
+                idx = self.test_local_ai_model_combo.findText(cfg_model)
+                if idx >= 0:
+                    self.test_local_ai_model_combo.setCurrentIndex(idx)
+    # --- Reverse sync: sub-tab radios → master Config tab radio ---
+    def _on_sub_tab_ai_changed(self, checked: bool = True):
+        """
+        Called when ANY per-tab AI radio button is toggled by the user.
+        Determines which provider is now active from the sender radio and
+        updates the master Config tab radio (radio_gemini / radio_local_ai)
+        WITHOUT triggering a feedback loop back through _on_ai_provider_changed.
+
+        This is the fix for: selecting Local AI in Get Price / Get Price All
+        still calling Gemini because get_config_dict() reads master radio only.
+        """
+        if not checked:
+            # Only act on the newly-checked radio, ignore the unchecked signal
+            return
+
+        sender = self.sender()
+        if sender is None:
+            return
+
+        # Determine desired provider from whichever radio fired
+        local_radios = [
+            getattr(self, 'get_price_radio_local_ai', None),
+            getattr(self, 'get_price_all_radio_local_ai', None),
+            getattr(self, 'test_radio_local_ai', None),
+        ]
+        want_local = sender in local_radios
+
+        # Block ALL radio signals temporarily to avoid feedback loop:
+        # master toggle → _on_ai_provider_changed → sub-tab toggle → _on_sub_tab_ai_changed → ...
+        all_radios = [
+            self.radio_gemini, self.radio_local_ai,
+        ]
+        for r in all_radios:
+            r.blockSignals(True)
+
+        # Update master
+        self.radio_local_ai.setChecked(want_local)
+        self.radio_gemini.setChecked(not want_local)
+
+        for r in all_radios:
+            r.blockSignals(False)
+
+        # Now sync all OTHER sub-tab radios (not the one that triggered this)
+        sub_local_radios = [
+            getattr(self, 'get_price_radio_local_ai', None),
+            getattr(self, 'get_price_all_radio_local_ai', None),
+            getattr(self, 'test_radio_local_ai', None),
+        ]
+        sub_gemini_radios = [
+            getattr(self, 'get_price_radio_gemini', None),
+            getattr(self, 'get_price_all_radio_gemini', None),
+            getattr(self, 'test_radio_gemini', None),
+        ]
+        for r in sub_local_radios + sub_gemini_radios:
+            if r:
+                r.blockSignals(True)
+
+        for r in sub_local_radios:
+            if r:
+                r.setChecked(want_local)
+        for r in sub_gemini_radios:
+            if r:
+                r.setChecked(not want_local)
+
+        for r in sub_local_radios + sub_gemini_radios:
+            if r:
+                r.blockSignals(False)
+
+        # Update info labels
+        model_text = self.local_ai_model_combo.currentText() if want_local else self.gemini_model_combo.currentText()
+        if hasattr(self, 'get_price_ai_model_label'):
+            self.get_price_ai_model_label.setText(f"({model_text})")
+        if hasattr(self, 'get_price_all_ai_model_label'):
+            self.get_price_all_ai_model_label.setText(f"({model_text})")
+
+        provider_name = "🏠 Local AI" if want_local else "🌐 Gemini"
+        self.log(f"AI provider switched to: {provider_name} ({model_text})", "INFO")
+
+    # --- Phase 10: Local AI Connection Test ---
+    def _action_test_local_ai_connection(self):
+        """Tests connectivity to the configured Local AI server URL."""
+        url = self.local_ai_url_input.text().strip()
+        if not url:
+            self.log("Local AI Server URL is empty. Please enter a URL first.", "WARN")
+            return
+
+        self.btn_test_local_ai.setEnabled(False)
+        self.btn_test_local_ai.setText("⏳ Testing...")
+        self.log(f"Testing connection to Local AI server: {url}/docs ...", "INFO")
+
+        def _do_test():
+            import threading
+            def worker():
+                try:
+                    test_url = url.rstrip("/") + "/docs"
+                    resp = requests.get(test_url, timeout=8)
+                    if resp.status_code == 200:
+                        self.log(f"✅ Local AI Server reachable! ({url}) — Swagger docs returned HTTP 200.", "SUCCESS")
+                    else:
+                        self.log(f"⚠️ Server responded with HTTP {resp.status_code} (may still be running).", "WARN")
+                except requests.exceptions.ConnectionError as e:
+                    self.log(f"❌ Cannot connect to Local AI server: {e}", "ERROR")
+                except requests.exceptions.Timeout:
+                    self.log(f"❌ Connection to {url} timed out after 8s.", "ERROR")
+                except Exception as e:
+                    self.log(f"❌ Local AI connection test error: {e}", "ERROR")
+                finally:
+                    self.btn_test_local_ai.setEnabled(True)
+                    self.btn_test_local_ai.setText("🔗 Test Connection")
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+
+        _do_test()
+
 
     def _browse_working_folder(self):
         curr = self.working_folder_input.text().strip() or os.getcwd()
@@ -2457,6 +3053,9 @@ class ChromeDriverTesterApp(QMainWindow):
             "google_search_api_key": self.search_key_input.text().strip(),
             "google_search_engine_id": self.search_cx_input.text().strip(),
             "target_url": self.url_input.text().strip(),
+            "ai_provider": "local_ai" if self.radio_local_ai.isChecked() else "gemini",
+            "local_ai_url": self.local_ai_url_input.text().strip(),
+            "local_ai_model": self.local_ai_model_combo.currentText().strip(),
         }
 
     def apply_config_dict(self, cfg: Dict[str, Any]):
@@ -2484,6 +3083,19 @@ class ChromeDriverTesterApp(QMainWindow):
         self.search_key_input.setText(cfg.get("google_search_api_key", ""))
         self.search_cx_input.setText(cfg.get("google_search_engine_id", ""))
         self.url_input.setText(cfg.get("target_url", "https://www.google.com"))
+
+        # Local AI settings (Phase 4)
+        ai_provider = cfg.get("ai_provider", "gemini")
+        if ai_provider == "local_ai":
+            self.radio_local_ai.setChecked(True)
+        else:
+            self.radio_gemini.setChecked(True)
+        self.local_ai_url_input.setText(cfg.get("local_ai_url", "https://api-localai.germantest.net"))
+        local_ai_model = cfg.get("local_ai_model", "qwen2.5vl:7b")
+        local_ai_idx = self.local_ai_model_combo.findText(local_ai_model)
+        self.local_ai_model_combo.setCurrentIndex(local_ai_idx if local_ai_idx >= 0 else 0)
+        # Sync all other tab radio buttons
+        self._on_ai_provider_changed()
 
     def _load_default_or_saved_config(self):
         if os.path.exists(CONFIG_FILE_PATH):
@@ -2890,6 +3502,19 @@ class ChromeDriverTesterApp(QMainWindow):
         self.spn_end_line.setEnabled(False)
         right_layout.addWidget(self.spn_end_line, 1, 3)
 
+        # AI provider selector for Get Price All (Phase 6) — synced with Configuration tab
+        gpa_ai_label = QLabel("AI Backend:")
+        gpa_ai_label.setStyleSheet("font-weight: bold;")
+        right_layout.addWidget(gpa_ai_label, 2, 0)
+        self.get_price_all_radio_gemini = QRadioButton("🌐 Gemini")
+        self.get_price_all_radio_gemini.setChecked(True)
+        right_layout.addWidget(self.get_price_all_radio_gemini, 2, 1)
+        self.get_price_all_radio_local_ai = QRadioButton("🏠 Local AI")
+        right_layout.addWidget(self.get_price_all_radio_local_ai, 2, 2)
+        self.get_price_all_ai_model_label = QLabel("")
+        self.get_price_all_ai_model_label.setStyleSheet("color: #555; font-style: italic;")
+        right_layout.addWidget(self.get_price_all_ai_model_label, 2, 3)
+
         # Action Buttons Layout
         btn_bar = QHBoxLayout()
         self.btn_start_batch = QPushButton("▶️ Start")
@@ -2907,7 +3532,7 @@ class ChromeDriverTesterApp(QMainWindow):
         self.btn_stop_batch.clicked.connect(self._action_stop_batch)
         btn_bar.addWidget(self.btn_stop_batch)
 
-        right_layout.addLayout(btn_bar, 2, 0, 1, 4)
+        right_layout.addLayout(btn_bar, 3, 0, 1, 4)
 
         top_layout.addWidget(group_right, stretch=5)
         layout.addLayout(top_layout)
