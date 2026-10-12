@@ -11,7 +11,7 @@
 
                 2. Extract 'product_name' (the exact name displayed in the UI for the main product).
 
-                3. Extract 'price' (the main price associated with this product). IMPORTANT: Ignore prices inside top banners, side advertisements, or 'Related Products' lists. If the main product is discontinued or has no price, return 'not_found'.
+                3. Extract 'price' (the main price associated with this product). IMPORTANT: priority price in "gói dịch vụ 1". Ignore prices inside top banners, side advertisements, or 'Related Products' lists. If the main product is discontinued or has no price, return 'not_found'.
 
                 4. Extract 'status' (e.g., 'In Stock', 'Còn hàng', 'Ngừng kinh doanh','TẠM HẾT HÀNG', return empty string if not found).
 
